@@ -1,0 +1,20 @@
+# secrets / local vaults
+*.v1
+*.enc
+*.key
+*.pem
+*.p12
+*.pfx
+*.kdbx
+*.db
+*.sqlite
+*.log
+
+# local dirs
+.local/
+.cache/
+__pycache__/
+*.pyc
+
+# m3hello local data
+m3hello-data/
