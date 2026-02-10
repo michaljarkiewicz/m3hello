@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SELF="m3hello-vault"
+QUIET="${M3HELLO_QUIET:-0}"
+
+log(){ [[ "$QUIET" == "1" ]] || echo "$SELF: $*" >&2; }
+die(){ echo "$SELF: FAIL: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "brak narzędzia: $1"; }
+
+# Ustal HOME dla konkretnego usera (ważne dla PAM, bo działa jako root)
+user_home() {
+  local u="$1"
+  local h
+  h="$(getent passwd "$u" | awk -F: '{print $6}')"
+  [[ -n "${h:-}" ]] || die "nie mogę ustalić home dla usera '$u'"
+  echo "$h"
+}
+
+# Bazowy katalog danych per-user
+base_dir() {
+  local u="${1:-}"
+  local home
+  if [[ -n "$u" ]]; then
+    home="$(user_home "$u")"
+    echo "$home/.local/share/m3hello/layer1"
+  else
+    echo "${XDG_DATA_HOME:-$HOME/.local/share}/m3hello/layer1"
+  fi
+}
+
+first_dev() {
+  fido2-token -L 2>/dev/null | awk -F: 'NR==1{print $1}'
+}
+
+# Wyciąga OSTATNI token base64, który po dekodowaniu ma 32 bajty.
+last_32b_token() {
+  python3 - <<'PY'
+import sys, re, base64, binascii
+
+token_re = re.compile(r"[A-Za-z0-9_\-+/=]{16,}")
+
+def dec_any(tok: str):
+    tok = tok.strip()
+    tokp = tok + "=" * ((4 - (len(tok) % 4)) % 4)
+    for fn in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            return fn(tokp)
+        except Exception:
+            pass
+    return None
+
+hits = []
+data = sys.stdin.read().splitlines()
+for line in data:
+    for tok in token_re.findall(line):
+        b = dec_any(tok)
+        if b is not None and len(b) == 32:
+            hits.append(tok)
+
+if hits:
+    sys.stdout.write(hits[-1])
+PY
+}
+
+b64_to_hex() {
+  python3 - <<'PY'
+import sys, base64
+tok=sys.stdin.read().strip()
+tokp = tok + "=" * ((4 - (len(tok) % 4)) % 4)
+b=base64.b64decode(tokp)
+sys.stdout.write(b.hex())
+PY
+}
+
+hex_hmac_sha256() {
+  local key_hex="$1"
+  openssl dgst -sha256 -mac HMAC -macopt "hexkey:${key_hex}" -binary | python3 - <<'PY'
+import sys
+sys.stdout.write(sys.stdin.buffer.read().hex())
+PY
+}
+
+rand_b64() { # rand_b64 Nbytes
+  head -c "$1" /dev/urandom | base64 -w0
+}
+
+# Derive two 32B keys from secret_hex:
+# enc_key = HMAC(secret, "m3hello.enc.v1")
+# mac_key = HMAC(secret, "m3hello.mac.v1")
+derive_keys() {
+  local secret_hex="$1"
+  local enc_hex mac_hex
+  enc_hex="$(printf '%s' 'm3hello.enc.v1' | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${secret_hex}" -binary | python3 - <<'PY'
+import sys; sys.stdout.write(sys.stdin.buffer.read().hex())
+PY
+)"
+  mac_hex="$(printf '%s' 'm3hello.mac.v1' | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${secret_hex}" -binary | python3 - <<'PY'
+import sys; sys.stdout.write(sys.stdin.buffer.read().hex())
+PY
+)"
+  echo "$enc_hex $mac_hex"
+}
+
+get_hmac_secret_b64() {
+  local u="${1:-}"
+  local d b l1 assert_param dev tmp out tok
+
+  d="$(base_dir "$u")"
+  assert_param="$d/assert_param"
+  [[ -f "$assert_param" ]] || die "brak $assert_param (uruchom: $SELF init ...)"
+
+  dev="$(first_dev)"
+  [[ -n "${dev:-}" ]] || die "nie widzę tokena FIDO2 (fido2-token -L)"
+
+  tmp="$(mktemp -d)"
+  out="$tmp/out"
+
+  # timeout zabezpiecza PAM przed wiszeniem
+  if ! timeout --foreground 25s fido2-assert -G -h -p -i "$assert_param" "$dev" >"$out" 2>"$tmp/err"; then
+    log "WARN: fido2-assert nie powiódł się:"
+    sed 's/^/  /' "$tmp/err" >&2 || true
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  tok="$(last_32b_token <"$out")"
+  rm -rf "$tmp"
+
+  [[ -n "${tok:-}" ]] || return 1
+  echo "$tok"
+}
+
+vault_paths() {
+  local u="${1:-}"
+  local d
+  d="$(base_dir "$u")"
+  echo "$d" "$d/keyring_pw.v1" "$d/assert_param"
+}
+
+cmd_init() {
+  need fido2-token
+  need fido2-cred
+  need fido2-assert
+  need openssl
+  need python3
+  need getent
+  need timeout
+
+  local user="${1:-$USER}"
+  local rp_id="${2:-m3hello.local}"
+  local d vault assert_param dev tmp cred_param make_out cdh user_id_b64 hmac_salt_b64 cred_id_b64
+
+  read -r d vault assert_param < <(vault_paths "$user")
+  mkdir -p "$d"
+
+  dev="$(first_dev)"
+  [[ -n "${dev:-}" ]] || die "nie widzę tokena FIDO2 (fido2-token -L)"
+
+  # clientDataHash (32B) — stabilny dla init
+  cdh="$(printf '%s' 'm3hello.layer1.init' | openssl dgst -sha256 -binary | base64 -w0)"
+
+  user_id_b64="$(rand_b64 32)"
+  hmac_salt_b64="$(rand_b64 32)"
+
+  tmp="$(mktemp -d)"
+  cred_param="$tmp/cred_param"
+  make_out="$tmp/make.out"
+
+  # Format wejścia fido2-cred jest liniowy; output zawiera m.in. credential id (linia 5). :contentReference[oaicite:0]{index=0}
+  {
+    echo "$cdh"
+    echo "$rp_id"
+    echo "$user"
+    echo "$user_id_b64"
+  } >"$cred_param"
+
+  log "INFO: dotknij klucza aby utworzyć credential (init)…"
+  timeout --foreground 40s fido2-cred -M -h -q -i "$cred_param" -o "$make_out" "$dev" || die "fido2-cred -M nie powiódł się"
+
+  cred_id_b64="$(sed -n '5p' "$make_out")"
+  [[ -n "${cred_id_b64:-}" ]] || die "nie udało się odczytać cred_id (linia 5 make.out)"
+
+  {
+    echo "$cdh"
+    echo "$rp_id"
+    echo "$cred_id_b64"
+    echo "$hmac_salt_b64"
+  } >"$assert_param"
+
+  rm -rf "$tmp"
+  log "OK: zapisano $assert_param"
+  log "INFO: następnie zrób: $SELF seal (żeby utworzyć vault z hasłem keyringa)"
+}
+
+cmd_seal() {
+  need fido2-token
+  need fido2-assert
+  need openssl
+  need python3
+  need getent
+  need timeout
+
+  local user="${1:-$USER}"
+  local d vault assert_param
+  local pw secret_b64 secret_hex enc_hex mac_hex iv_b64 iv_hex ct_b64 ct_bin mac_bin mac_b64
+
+  read -r d vault assert_param < <(vault_paths "$user")
+  mkdir -p "$d"
+
+  [[ -f "$assert_param" ]] || die "brak $assert_param (zrób najpierw: $SELF init ...)"
+
+  # Pobierz hasło keyringa od usera (dokładnie takie jak działa w popupie GNOME)
+  printf "Wpisz AKTUALNE hasło Login keyring (dokładnie to, które działa w okienku GNOME): " >&2
+  IFS= read -r -s pw
+  echo >&2
+  [[ -n "${pw:-}" ]] || die "puste hasło — przerwano"
+
+  log "Dotknij klucza, aby zaszyfrować hasło keyringu (touch-only)…"
+  secret_b64="$(get_hmac_secret_b64 "$user")" || die "Nie uzyskano hmac-secret z klucza."
+  secret_hex="$(printf '%s' "$secret_b64" | b64_to_hex)"
+  [[ "${#secret_hex}" -eq 64 ]] || die "hmac-secret hex ma złą długość (${#secret_hex})"
+
+  read -r enc_hex mac_hex < <(derive_keys "$secret_hex")
+  iv_b64="$(rand_b64 16)"
+  iv_hex="$(printf '%s' "$iv_b64" | b64_to_hex)"
+
+  # szyfruj (bez dopisywania newline)
+  ct_bin="$(printf '%s' "$pw" | openssl enc -aes-256-ctr -K "$enc_hex" -iv "$iv_hex" -nosalt 2>/dev/null)"
+  ct_b64="$(printf '%s' "$ct_bin" | base64 -w0)"
+
+  # MAC = HMAC(mac_key, iv||ct)
+  mac_bin="$( (printf '%s' "$iv_b64" | base64 -d; printf '%s' "$ct_bin") | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${mac_hex}" -binary 2>/dev/null )"
+  mac_b64="$(printf '%s' "$mac_bin" | base64 -w0)"
+
+  {
+    echo "v1"
+    echo "$iv_b64"
+    echo "$ct_b64"
+    echo "$mac_b64"
+  } >"$vault"
+
+  chmod 600 "$vault"
+  log "OK: zapisano $vault"
+}
+
+cmd_open() {
+  need fido2-token
+  need fido2-assert
+  need openssl
+  need python3
+  need getent
+  need timeout
+
+  local user="${1:-$USER}"
+  local d vault assert_param
+  local v iv_b64 ct_b64 mac_b64 secret_b64 secret_hex enc_hex mac_hex iv_hex ct_bin mac_calc_bin mac_calc_b64 pw
+
+  read -r d vault assert_param < <(vault_paths "$user")
+  [[ -f "$vault" ]] || die "brak vault: $vault (zrób: $SELF seal)"
+  [[ -f "$assert_param" ]] || die "brak assert_param: $assert_param"
+
+  mapfile -t v <"$vault"
+  [[ "${v[0]:-}" == "v1" ]] || die "zły format vault (oczekiwano v1)"
+  iv_b64="${v[1]:-}"; ct_b64="${v[2]:-}"; mac_b64="${v[3]:-}"
+  [[ -n "$iv_b64" && -n "$ct_b64" && -n "$mac_b64" ]] || die "vault niekompletny"
+
+  log "Dotknij klucza, aby odszyfrować hasło keyringu (touch-only)…"
+  secret_b64="$(get_hmac_secret_b64 "$user")" || die "Nie uzyskano hmac-secret z klucza."
+  secret_hex="$(printf '%s' "$secret_b64" | b64_to_hex)"
+  [[ "${#secret_hex}" -eq 64 ]] || die "hmac-secret hex ma złą długość (${#secret_hex})"
+
+  read -r enc_hex mac_hex < <(derive_keys "$secret_hex")
+  iv_hex="$(printf '%s' "$iv_b64" | b64_to_hex)"
+
+  ct_bin="$(printf '%s' "$ct_b64" | base64 -d)"
+  mac_calc_bin="$( (printf '%s' "$iv_b64" | base64 -d; printf '%s' "$ct_bin") | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${mac_hex}" -binary 2>/dev/null )"
+  mac_calc_b64="$(printf '%s' "$mac_calc_bin" | base64 -w0)"
+
+  [[ "$mac_calc_b64" == "$mac_b64" ]] || die "MAC mismatch (zły klucz / zły token / uszkodzony vault)"
+
+  pw="$(printf '%s' "$ct_bin" | openssl enc -d -aes-256-ctr -K "$enc_hex" -iv "$iv_hex" -nosalt 2>/dev/null)"
+  # stdout: hasło bez newline (ważne dla PAM)
+  printf '%s' "$pw"
+}
+
+usage() {
+  cat >&2 <<EOF
+$SELF — Layer1 vault helper (hmac-secret)
+
+Użycie:
+  $SELF init [USER] [RP_ID]
+  $SELF seal [USER]
+  $SELF open [USER]
+
+Zmienne:
+  M3HELLO_QUIET=1   wycisza logi (dla PAM)
+
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init) cmd_init "$@";;
+    seal|store) cmd_seal "$@";;
+    open) cmd_open "$@";;
+    ""|-h|--help|help) usage;;
+    *) die "nieznana komenda: $cmd";;
+  esac
+}
+
+main "$@"
