@@ -1,0 +1,4 @@
+# Example only (DO NOT use as-is)
+# Format:
+# username:KeyHandle,PublicKey
+USER_NAME:REDACTED_KEYHANDLE,REDACTED_PUBLICKEY

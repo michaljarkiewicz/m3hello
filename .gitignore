@@ -1,20 +1,17 @@
-# secrets / local vaults
-*.v1
-*.enc
-*.key
-*.pem
-*.p12
-*.pfx
-*.kdbx
-*.db
-*.sqlite
-*.log
+# Secrets / local state (NIE commitujemy)
+**/u2f_mappings
+**/u2f_keys
+**/*.enc
+**/*.vault
+**/keyring_pw.*
+**/assert_param
+**/hmac_salt*
+**/*.key
+**/*.id
+**/*.out
 
-# local dirs
-.local/
-.cache/
-__pycache__/
-*.pyc
-
-# m3hello local data
-m3hello-data/
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+*~
