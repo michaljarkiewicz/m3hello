@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: m3hello-keyringctl <command>
+
+Commands:
+  status   Show default keyring collection Locked state
+  owner    Show current DBus owner for org.freedesktop.secrets
+  retry    Restart gnome-keyring-daemon.service (triggers touch unlock path)
+  logs     Show recent gnome-keyring-daemon.service logs
+USAGE
+}
+
+get_col() {
+  gdbus call --session \
+    --dest org.freedesktop.secrets \
+    --object-path /org/freedesktop/secrets \
+    --method org.freedesktop.Secret.Service.ReadAlias default \
+    | awk -F"'" '{print $2}'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  status)
+    col="$(get_col)"
+    gdbus call --session \
+      --dest org.freedesktop.secrets \
+      --object-path "$col" \
+      --method org.freedesktop.DBus.Properties.Get \
+        org.freedesktop.Secret.Collection Locked
+    ;;
+  owner)
+    busctl --user status org.freedesktop.secrets | sed -n '1,60p'
+    ;;
+  retry)
+    systemctl --user restart gnome-keyring-daemon.service
+    echo "OK: restarted gnome-keyring-daemon.service"
+    ;;
+  logs)
+    journalctl --user -u gnome-keyring-daemon.service -n 120 --no-pager
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    echo "ERROR: unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

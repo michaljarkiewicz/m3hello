@@ -15,3 +15,7 @@
 *.swp
 *.swo
 *~
+
+# build artifacts
+layer1/pam/*.o
+layer1/pam/*.so

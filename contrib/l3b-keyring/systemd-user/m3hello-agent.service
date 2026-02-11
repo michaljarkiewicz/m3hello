@@ -1,0 +1,15 @@
+[Unit]
+Description=m3hello L3B agent (unlock GNOME Keyring early)
+PartOf=graphical-session.target
+After=graphical-session.target
+After=dbus.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/m3hello-agent-keyring
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

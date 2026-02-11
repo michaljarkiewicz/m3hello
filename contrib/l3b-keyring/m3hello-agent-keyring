@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+svc="gnome-keyring-daemon.service"
+
+get_locked_state() {
+  local col locked
+  col="$(timeout 3s gdbus call --session \
+    --dest org.freedesktop.secrets \
+    --object-path /org/freedesktop/secrets \
+    --method org.freedesktop.Secret.Service.ReadAlias default \
+    | awk -F"'" '{print $2}' 2>/dev/null || true)"
+
+  [ -z "${col:-}" ] && return 2
+
+  locked="$(timeout 3s gdbus call --session \
+    --dest org.freedesktop.secrets \
+    --object-path "$col" \
+    --method org.freedesktop.DBus.Properties.Get \
+      org.freedesktop.Secret.Collection Locked 2>/dev/null || true)"
+
+  echo "$locked"
+  return 0
+}
+
+# 0) If already unlocked -> done.
+state="$(get_locked_state || true)"
+if echo "$state" | grep -q "<false>"; then
+  exit 0
+fi
+
+# 1) Decide ONE action:
+# - If service is active: restart (to trigger wrapper unlock at daemon start)
+# - If inactive: start
+if /usr/bin/systemctl --user is-active --quiet "$svc"; then
+  /usr/bin/systemctl --user restart "$svc"
+else
+  /usr/bin/systemctl --user start "$svc"
+fi
+
+# 2) Poll for unlocked (max ~60s, to give time for touch + DBus settle)
+for _ in $(seq 1 60); do
+  state="$(get_locked_state || true)"
+  if echo "$state" | grep -q "<false>"; then
+    exit 0
+  fi
+  sleep 1
+done
+
+exit 1
