@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+uid="$(id -u)"
+runtime="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+control_dir="$runtime/keyring"
+components="pkcs11,secrets"
+
+# Opcjonalny, bezpieczny “prompt” w GUI (jeśli notify-send jest dostępny)
+if command -v notify-send >/dev/null 2>&1; then
+  notify-send -u low -t 8000 "m3hello" "Dotknij YubiKey, aby odblokować GNOME Keyring (Login)." || true
+fi
+
+# Próba unlock na starcie demona (bez plaintext na dysku/argv).
+# Jeśli vault nie da hasła (brak klucza / timeout / błąd), robimy fallback: start demona bez --unlock.
+# Timeout chroni przed “wiszeniem” w nieskończoność na starcie sesji.
+if timeout 120s /usr/local/bin/m3hello-vault open "$USER" \
+  | /usr/bin/gnome-keyring-daemon --foreground \
+      --components="$components" \
+      --control-directory="$control_dir" \
+      --unlock
+then
+  exit 0
+fi
+
+# Fallback: start bez odblokowania (żeby sesja działała, ale keyring pozostanie locked i GUI może poprosić o hasło).
+exec /usr/bin/gnome-keyring-daemon --foreground \
+  --components="$components" \
+  --control-directory="$control_dir"
